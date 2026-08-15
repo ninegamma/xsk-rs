@@ -185,6 +185,37 @@ async fn frame_consumed_with_consume_one_should_match_addr_of_one_produced() {
     build_configs_and_run_test(test).await
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn nb_avail_reports_completed_tx_frames_and_honors_desired() {
+    fn test(dev1: (Xsk, PacketGenerator), _dev2: (Xsk, PacketGenerator)) {
+        let mut xsk1 = dev1.0;
+
+        assert_eq!(xsk1.cq.nb_avail(CQ_SIZE), 0);
+
+        for desc in &mut xsk1.descs[..2] {
+            unsafe {
+                xsk1.umem
+                    .data_mut(desc)
+                    .cursor()
+                    .write_all(&ETHERNET_PACKET[..])
+                    .unwrap();
+            }
+        }
+
+        assert_eq!(
+            unsafe { xsk1.tx_q.produce_and_wakeup(&xsk1.descs[..2]).unwrap() },
+            2
+        );
+        thread::sleep(Duration::from_millis(5));
+
+        assert_eq!(xsk1.cq.nb_avail(1), 1);
+        assert_eq!(xsk1.cq.nb_avail(CQ_SIZE), 2);
+    }
+
+    build_configs_and_run_test(test).await
+}
+
 async fn build_configs_and_run_test<F>(test: F)
 where
     F: Fn((Xsk, PacketGenerator), (Xsk, PacketGenerator)) + Send + 'static,
