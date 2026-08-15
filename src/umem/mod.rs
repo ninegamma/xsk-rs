@@ -27,6 +27,8 @@ use crate::{
     ring::{XskRingCons, XskRingConsHandle, XskRingProd, XskRingProdHandle},
 };
 
+use crate::config::UmemConfigOpts;
+
 /// The [`Umem`] pointer, along with everything libxdp dereferences
 /// when deleting it.
 ///
@@ -187,6 +189,82 @@ impl Umem {
             // deletes the UMEM instead of leaving it behind.
             return Err(UmemCreateError { reason, err: None });
         }
+
+        let frame_count = frame_count.get() as usize;
+
+        let mut frame_descs: Vec<FrameDesc> = Vec::with_capacity(frame_count);
+
+        for i in 0..frame_count {
+            let addr = (i * frame_layout.frame_size())
+                + frame_layout.xdp_headroom
+                + frame_layout.frame_headroom;
+
+            frame_descs.push(FrameDesc::new(addr));
+        }
+
+        let umem = Umem {
+            inner: Arc::new(Mutex::new(inner)),
+            mem,
+        };
+
+        Ok((umem, frame_descs))
+    }
+
+    /// same as new but using the latest API of lib_xdp for umem creation, namely xdp_umem_create_opts
+    /// this supports flags and metadata
+    pub fn new_with_opts(
+        config: UmemConfigOpts,
+        use_huge_pages: bool,
+    ) -> Result<(Self, Vec<FrameDesc>), UmemCreateError> {
+        let frame_layout = config.into();
+        let frame_count = config.frame_count();
+
+        let mem = UmemRegion::new(frame_count, frame_layout, use_huge_pages).map_err(|e| {
+            UmemCreateError {
+                reason: "failed to create mmap'd UMEM region",
+                err: Some(e),
+            }
+        })?;
+
+        let fq = XskRingProd::default();
+        let cq = XskRingCons::default();
+
+        let umem_ptr = unsafe {
+            libxdp_sys::xsk_umem__create_opts(
+                mem.as_ptr(),
+                fq.as_ptr(),
+                cq.as_ptr(),
+                &mut config.into(),
+            )
+        };
+
+        let umem_ptr = match NonNull::new(umem_ptr) {
+            Some(umem_ptr) => umem_ptr,
+            None => {
+                return Err(UmemCreateError {
+                    reason: "UMEM is null",
+                    err: Some(io::Error::last_os_error()),
+                });
+            }
+        };
+
+        if fq.is_ring_null() {
+            return Err(UmemCreateError {
+                reason: "fill queue ring is null",
+                err: Some(io::Error::last_os_error()),
+            });
+        };
+
+        if cq.is_ring_null() {
+            return Err(UmemCreateError {
+                reason: "comp queue ring is null",
+                err: Some(io::Error::last_os_error()),
+            });
+        }
+
+        // SAFETY: this is the only `UmemInner` instance for this pointer,
+        // and it retains the rings and mapped memory until UMEM deletion.
+        let inner = unsafe { UmemInner::new(umem_ptr, (fq, cq), mem.clone()) };
 
         let frame_count = frame_count.get() as usize;
 
@@ -482,6 +560,16 @@ impl FrameLayout {
 
 impl From<UmemConfig> for FrameLayout {
     fn from(c: UmemConfig) -> Self {
+        Self {
+            xdp_headroom: c.xdp_headroom() as usize,
+            frame_headroom: c.frame_headroom() as usize,
+            mtu: c.mtu() as usize,
+        }
+    }
+}
+
+impl From<UmemConfigOpts> for FrameLayout {
+    fn from(c: UmemConfigOpts) -> Self {
         Self {
             xdp_headroom: c.xdp_headroom() as usize,
             frame_headroom: c.frame_headroom() as usize,

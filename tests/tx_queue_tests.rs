@@ -92,7 +92,6 @@ async fn nb_free_reports_available_tx_slots() {
     build_configs_and_run_test(test).await
 }
 
-
 async fn build_configs_and_run_test<F>(test: F)
 where
     F: Fn((Xsk, PacketGenerator), (Xsk, PacketGenerator)) + Send + 'static,

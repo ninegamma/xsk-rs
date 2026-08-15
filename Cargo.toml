@@ -16,6 +16,9 @@ libc = "0.2.189"
 libxdp-sys = "0.2.4"
 log = "0.4.33"
 
+[patch.crates-io]
+libxdp-sys = { git = "https://github.com/ninegamma/libxdp-sys.git", branch = "ninegamma" }
+
 [dev-dependencies]
 anyhow = "1.0.97"
 crossbeam-channel = "0.5.15"

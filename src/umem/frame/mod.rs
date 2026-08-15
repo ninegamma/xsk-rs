@@ -86,7 +86,7 @@ impl FrameDesc {
         self.lengths = SegmentLengths { headroom, data };
         self
     }
-    
+
     /// The starting address of the packet data segment of the frame
     /// pointed at by this descriptor.
     #[inline]
