@@ -1,6 +1,6 @@
 #[allow(dead_code)]
 mod setup;
-use setup::{ETHERNET_PACKET, PacketGenerator, Xsk, XskConfig};
+use setup::{ETHERNET_PACKET, PacketGenerator, WAIT_TIMEOUT, Xsk, XskConfig, wait_until};
 
 use serial_test::serial;
 use std::{convert::TryInto, io::Write, thread, time::Duration};
@@ -187,13 +187,61 @@ async fn frame_consumed_with_consume_one_should_match_addr_of_one_produced() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn nb_avail_reports_completed_tx_frames_and_honors_desired() {
+async fn nb_avail_on_fresh_queue_is_zero() {
     fn test(dev1: (Xsk, PacketGenerator), _dev2: (Xsk, PacketGenerator)) {
         let mut xsk1 = dev1.0;
 
-        assert_eq!(xsk1.cq.nb_avail(CQ_SIZE), 0);
+        assert_eq!(xsk1.cq.nb_avail(), 0);
+    }
 
-        for desc in &mut xsk1.descs[..2] {
+    build_configs_and_run_test(test).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn nb_avail_sees_late_arrivals() {
+    fn test(dev1: (Xsk, PacketGenerator), _dev2: (Xsk, PacketGenerator)) {
+        let mut xsk1 = dev1.0;
+
+        for i in 0..2 {
+            unsafe {
+                xsk1.umem
+                    .data_mut(&mut xsk1.descs[i])
+                    .cursor()
+                    .write_all(&ETHERNET_PACKET[..])
+                    .unwrap();
+            }
+        }
+
+        assert_eq!(
+            unsafe { xsk1.tx_q.produce_and_wakeup(&xsk1.descs[..1]).unwrap() },
+            1
+        );
+
+        // Nothing is consumed in between, so a count read from a
+        // cached producer position would still report one here.
+        wait_until(WAIT_TIMEOUT, || xsk1.cq.nb_avail() == 1);
+
+        assert_eq!(
+            unsafe { xsk1.tx_q.produce_and_wakeup(&xsk1.descs[1..2]).unwrap() },
+            1
+        );
+
+        wait_until(WAIT_TIMEOUT, || xsk1.cq.nb_avail() == 2);
+    }
+
+    build_configs_and_run_test(test).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn nb_avail_does_not_consume() {
+    fn test(dev1: (Xsk, PacketGenerator), _dev2: (Xsk, PacketGenerator)) {
+        let mut xsk1 = dev1.0;
+
+        let (tx_frames, rx_frames) = xsk1.descs.split_at_mut(2);
+
+        for desc in tx_frames.iter_mut() {
             unsafe {
                 xsk1.umem
                     .data_mut(desc)
@@ -204,13 +252,28 @@ async fn nb_avail_reports_completed_tx_frames_and_honors_desired() {
         }
 
         assert_eq!(
-            unsafe { xsk1.tx_q.produce_and_wakeup(&xsk1.descs[..2]).unwrap() },
+            unsafe { xsk1.tx_q.produce_and_wakeup(tx_frames).unwrap() },
             2
         );
-        thread::sleep(Duration::from_millis(5));
 
-        assert_eq!(xsk1.cq.nb_avail(1), 1);
-        assert_eq!(xsk1.cq.nb_avail(CQ_SIZE), 2);
+        wait_until(WAIT_TIMEOUT, || xsk1.cq.nb_avail() == 2);
+
+        assert_eq!(unsafe { xsk1.cq.consume(&mut rx_frames[..2]) }, 2);
+
+        let mut txd_addrs = tx_frames
+            .iter()
+            .map(FrameDesc::addr)
+            .collect::<Vec<usize>>();
+
+        let mut rxd_addrs = rx_frames[..2]
+            .iter()
+            .map(FrameDesc::addr)
+            .collect::<Vec<usize>>();
+
+        txd_addrs.sort();
+        rxd_addrs.sort();
+
+        assert_eq!(txd_addrs, rxd_addrs);
     }
 
     build_configs_and_run_test(test).await

@@ -1,4 +1,7 @@
-use crate::{ring::XskRingCons, socket::Socket};
+use crate::{
+    ring::{self, XskRingCons},
+    socket::Socket,
+};
 
 use super::frame::FrameDesc;
 
@@ -109,17 +112,14 @@ impl CompQueue {
         cnt as usize
     }
 
-    /// Returns the number of items currently available in the completion queue.
+    /// The number of entries ready to be consumed.
     ///
-    /// This can be used to check how many completed TX frames are ready to be consumed
-    /// without actually consuming them.
-    ///
-    /// # Arguments
-    ///
-    /// * `desired` - The maximum number of items you want to check for. The return value
-    ///  will be min(desired, actual_available).
+    /// Reads the current producer position rather than a cached one,
+    /// so this can be used to watch a backlog without consuming it.
     #[inline]
-    pub fn nb_avail(&mut self, desired: u32) -> u32 {
-        unsafe { libxdp_sys::xsk_cons_nb_avail(self.ring.as_ptr(), desired) }
+    pub fn nb_avail(&mut self) -> u32 {
+        // SAFETY: the ring is initialised and `&mut self` excludes
+        // any other access to it.
+        unsafe { ring::cons_nb_avail(self.ring.as_ptr()) }
     }
 }
