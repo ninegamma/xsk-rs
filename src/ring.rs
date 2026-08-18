@@ -16,6 +16,59 @@ use std::{cell::UnsafeCell, fmt, ptr, sync::Arc};
 
 use libxdp_sys::{xsk_ring_cons, xsk_ring_prod};
 
+/// The number of free slots on a producer ring.
+///
+/// # Safety
+///
+/// `ring` must point at an initialised ring, and the caller must
+/// have exclusive access to it, as this writes the ring's cached
+/// consumer position.
+pub(crate) unsafe fn prod_nb_free(ring: *mut xsk_ring_prod) -> u32 {
+    // libxdp answers from its cached consumer position whenever that
+    // cache already holds as many slots as were asked for, and only
+    // reloads the real position otherwise. Asking for the ring size
+    // therefore ensures the value returned is always up to date.
+    let size = unsafe { (*ring).size };
+
+    unsafe { libxdp_sys::xsk_prod_nb_free(ring, size) }
+}
+
+/// The number of entries ready to be consumed on a consumer ring.
+///
+/// # Safety
+///
+/// See [`prod_nb_free`]. This writes the ring's cached producer and
+/// consumer positions.
+pub(crate) unsafe fn cons_nb_avail(ring: *mut xsk_ring_cons) -> u32 {
+    let size = unsafe { (*ring).size };
+
+    let mut idx = 0;
+
+    // The first peek bumps cached_cons by the number of frames the
+    // cache knew about. The second peek results in a refresh of that
+    // cache, and gives us the number of consumable frames the cache
+    // did not know about. Together, we have the number of consumable
+    // frames at this point in time.
+    let n = unsafe {
+        libxdp_sys::xsk_ring_cons__peek(ring, size, &mut idx)
+            + libxdp_sys::xsk_ring_cons__peek(ring, size, &mut idx)
+    };
+
+    // One cancel, after both peeks. Cancelling between them would
+    // restore the cache the first peek emptied, so the second would
+    // count the same entries again.
+    //
+    // The cancel does not undo the reload. A following consume
+    // sees the current producer position without paying for a
+    // reload of its own. Nothing here writes ring memory or the
+    // consumer position, and the cancel gives back exactly what
+    // the peeks took, so a following consume still hands out
+    // every entry from the first.
+    unsafe { libxdp_sys::xsk_ring_cons__cancel(ring, n) };
+
+    n
+}
+
 /// A consumer ring.
 ///
 /// The ring is reachable only as a raw pointer, through [`as_ptr`]:
@@ -198,3 +251,314 @@ impl fmt::Debug for XskRingProdHandle {
 
 // SAFETY: this handle grants no access to the ring it keeps alive.
 unsafe impl Send for XskRingProdHandle {}
+
+#[cfg(test)]
+mod tests {
+    use libxdp_sys::{
+        xsk_ring_cons__peek, xsk_ring_cons__release, xsk_ring_prod__reserve, xsk_ring_prod__submit,
+    };
+
+    use super::*;
+
+    const SIZE: u32 = 4;
+
+    /// Memory standing in for the pages the kernel maps for a ring.
+    struct RingMem {
+        positions: Box<[u32; 2]>,
+        entries: Box<[u64]>,
+    }
+
+    impl RingMem {
+        fn new(size: u32) -> Self {
+            Self {
+                positions: Box::new([0; 2]),
+                entries: vec![0; size as usize].into_boxed_slice(),
+            }
+        }
+
+        fn producer(&mut self) -> *mut u32 {
+            &mut self.positions[0]
+        }
+
+        fn consumer(&mut self) -> *mut u32 {
+            &mut self.positions[1]
+        }
+
+        fn entries(&mut self) -> *mut u64 {
+            self.entries.as_mut_ptr()
+        }
+    }
+
+    /// A consumer ring backed by memory the test owns.
+    struct FakeCons {
+        ring: xsk_ring_cons,
+        _mem: RingMem,
+    }
+
+    impl FakeCons {
+        fn new(size: u32) -> Self {
+            let mut mem = RingMem::new(size);
+
+            // libxdp sets an rx ring's cached positions from the
+            // ring's own and leaves a comp ring's zeroed, which on a
+            // fresh ring comes to the same thing.
+            let ring = xsk_ring_cons {
+                cached_prod: 0,
+                cached_cons: 0,
+                mask: size - 1,
+                size,
+                producer: mem.producer(),
+                consumer: mem.consumer(),
+                ring: mem.entries().cast(),
+                flags: ptr::null_mut(),
+            };
+
+            Self { ring, _mem: mem }
+        }
+
+        fn as_ptr(&mut self) -> *mut xsk_ring_cons {
+            &mut self.ring
+        }
+
+        /// Hand `nb` entries to the ring, as the kernel would.
+        fn kernel_produce(&mut self, nb: u32) {
+            unsafe { *self.ring.producer += nb };
+        }
+
+        fn cached_cons(&self) -> u32 {
+            self.ring.cached_cons
+        }
+
+        fn consumer(&self) -> u32 {
+            unsafe { *self.ring.consumer }
+        }
+    }
+
+    /// A producer ring backed by memory the test owns.
+    ///
+    /// See [`FakeCons`].
+    struct FakeProd {
+        ring: xsk_ring_prod,
+        _mem: RingMem,
+    }
+
+    impl FakeProd {
+        fn new(size: u32) -> Self {
+            let mut mem = RingMem::new(size);
+
+            // libxdp keeps a producer ring's cached consumer
+            // position a ring size ahead of the real one, which is
+            // the addition `xsk_prod_nb_free` avoids by leaving it
+            // there.
+            let ring = xsk_ring_prod {
+                cached_prod: 0,
+                cached_cons: size,
+                mask: size - 1,
+                size,
+                producer: mem.producer(),
+                consumer: mem.consumer(),
+                ring: mem.entries().cast(),
+                flags: ptr::null_mut(),
+            };
+
+            Self { ring, _mem: mem }
+        }
+
+        fn as_ptr(&mut self) -> *mut xsk_ring_prod {
+            &mut self.ring
+        }
+
+        /// Take `nb` entries off the ring, as the kernel would.
+        fn kernel_consume(&mut self, nb: u32) {
+            unsafe { *self.ring.consumer += nb };
+        }
+
+        fn cached_prod(&self) -> u32 {
+            self.ring.cached_prod
+        }
+    }
+
+    // These call into libxdp, which Miri cannot execute.
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn cons_nb_avail_is_zero_on_an_empty_ring() {
+        let mut cons = FakeCons::new(SIZE);
+
+        assert_eq!(unsafe { cons_nb_avail(cons.as_ptr()) }, 0);
+        assert_eq!(unsafe { cons_nb_avail(cons.as_ptr()) }, 0);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn cons_nb_avail_sees_late_arrivals() {
+        let mut cons = FakeCons::new(SIZE);
+
+        cons.kernel_produce(1);
+
+        assert_eq!(unsafe { cons_nb_avail(cons.as_ptr()) }, 1);
+
+        cons.kernel_produce(2);
+
+        assert_eq!(unsafe { cons_nb_avail(cons.as_ptr()) }, 3);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn cons_nb_avail_is_idempotent() {
+        let mut cons = FakeCons::new(SIZE);
+
+        cons.kernel_produce(2);
+
+        for _ in 0..3 {
+            assert_eq!(unsafe { cons_nb_avail(cons.as_ptr()) }, 2);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn cons_nb_avail_restores_the_ring_positions() {
+        let mut cons = FakeCons::new(SIZE);
+
+        cons.kernel_produce(2);
+
+        let cached_cons = cons.cached_cons();
+        let consumer = cons.consumer();
+
+        assert_eq!(unsafe { cons_nb_avail(cons.as_ptr()) }, 2);
+
+        assert_eq!(cons.cached_cons(), cached_cons);
+        assert_eq!(cons.consumer(), consumer);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn cons_nb_avail_after_a_partial_consume() {
+        let mut cons = FakeCons::new(SIZE);
+
+        cons.kernel_produce(3);
+
+        let mut idx = 0;
+
+        assert_eq!(
+            unsafe { xsk_ring_cons__peek(cons.as_ptr(), 1, &mut idx) },
+            1
+        );
+
+        unsafe { xsk_ring_cons__release(cons.as_ptr(), 1) };
+
+        assert_eq!(unsafe { cons_nb_avail(cons.as_ptr()) }, 2);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn cons_nb_avail_reports_a_full_ring() {
+        let mut cons = FakeCons::new(SIZE);
+
+        cons.kernel_produce(SIZE);
+
+        assert_eq!(unsafe { cons_nb_avail(cons.as_ptr()) }, SIZE);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn cons_nb_avail_leaves_every_entry_for_a_later_peek() {
+        let mut cons = FakeCons::new(SIZE);
+
+        cons.kernel_produce(3);
+
+        assert_eq!(unsafe { cons_nb_avail(cons.as_ptr()) }, 3);
+
+        let mut idx = 0;
+
+        assert_eq!(
+            unsafe { xsk_ring_cons__peek(cons.as_ptr(), 3, &mut idx) },
+            3
+        );
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn prod_nb_free_is_the_ring_size_on_an_empty_ring() {
+        let mut prod = FakeProd::new(SIZE);
+
+        assert_eq!(unsafe { prod_nb_free(prod.as_ptr()) }, SIZE);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn prod_nb_free_is_zero_on_a_full_ring() {
+        let mut prod = FakeProd::new(SIZE);
+
+        let mut idx = 0;
+
+        assert_eq!(
+            unsafe { xsk_ring_prod__reserve(prod.as_ptr(), SIZE, &mut idx) },
+            SIZE
+        );
+
+        unsafe { xsk_ring_prod__submit(prod.as_ptr(), SIZE) };
+
+        assert_eq!(unsafe { prod_nb_free(prod.as_ptr()) }, 0);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn prod_nb_free_tracks_reservations() {
+        let mut prod = FakeProd::new(SIZE);
+
+        let mut idx = 0;
+
+        assert_eq!(
+            unsafe { xsk_ring_prod__reserve(prod.as_ptr(), 2, &mut idx) },
+            2
+        );
+
+        assert_eq!(unsafe { prod_nb_free(prod.as_ptr()) }, 2);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn prod_nb_free_sees_entries_taken_by_the_kernel() {
+        let mut prod = FakeProd::new(SIZE);
+
+        let mut idx = 0;
+
+        assert_eq!(
+            unsafe { xsk_ring_prod__reserve(prod.as_ptr(), 2, &mut idx) },
+            2
+        );
+
+        unsafe { xsk_ring_prod__submit(prod.as_ptr(), 2) };
+
+        prod.kernel_consume(2);
+
+        assert_eq!(unsafe { prod_nb_free(prod.as_ptr()) }, SIZE);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn prod_nb_free_leaves_the_cached_producer_position_alone() {
+        let mut prod = FakeProd::new(SIZE);
+
+        let mut idx = 0;
+
+        assert_eq!(
+            unsafe { xsk_ring_prod__reserve(prod.as_ptr(), 2, &mut idx) },
+            2
+        );
+
+        unsafe { xsk_ring_prod__submit(prod.as_ptr(), 2) };
+
+        let cached_prod = prod.cached_prod();
+
+        assert_eq!(unsafe { prod_nb_free(prod.as_ptr()) }, 2);
+        assert_eq!(prod.cached_prod(), cached_prod);
+
+        assert_eq!(
+            unsafe { xsk_ring_prod__reserve(prod.as_ptr(), 2, &mut idx) },
+            2
+        );
+    }
+}

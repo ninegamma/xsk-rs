@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## Added
+
+- `TxQueue::nb_free` and `FillQueue::nb_free`, the number of free slots on the ring, and `RxQueue::nb_avail` and
+  `CompQueue::nb_avail`, the number of entries waiting to be consumed.
+
 ## [0.9.0] - 2026-08-15
 
 ## Added
