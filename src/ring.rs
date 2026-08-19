@@ -23,7 +23,8 @@ use libxdp_sys::{xsk_ring_cons, xsk_ring_prod};
 /// `ring` must point at an initialised ring, and the caller must
 /// have exclusive access to it, as this writes the ring's cached
 /// consumer position.
-pub(crate) unsafe fn prod_nb_free(ring: *mut xsk_ring_prod) -> u32 {
+#[inline]
+pub(crate) unsafe fn prod_nb_free_exact(ring: *mut xsk_ring_prod) -> u32 {
     // libxdp answers from its cached consumer position whenever that
     // cache already holds as many slots as were asked for, and only
     // reloads the real position otherwise. Asking for the ring size
@@ -37,9 +38,10 @@ pub(crate) unsafe fn prod_nb_free(ring: *mut xsk_ring_prod) -> u32 {
 ///
 /// # Safety
 ///
-/// See [`prod_nb_free`]. This writes the ring's cached producer and
-/// consumer positions.
-pub(crate) unsafe fn cons_nb_avail(ring: *mut xsk_ring_cons) -> u32 {
+/// See [`prod_nb_free_exact`]. This writes the ring's cached
+/// producer and consumer positions.
+#[inline]
+pub(crate) unsafe fn cons_nb_avail_exact(ring: *mut xsk_ring_cons) -> u32 {
     let size = unsafe { (*ring).size };
 
     let mut idx = 0;
@@ -255,7 +257,8 @@ unsafe impl Send for XskRingProdHandle {}
 #[cfg(test)]
 mod tests {
     use libxdp_sys::{
-        xsk_ring_cons__peek, xsk_ring_cons__release, xsk_ring_prod__reserve, xsk_ring_prod__submit,
+        xdp_desc, xsk_ring_cons__peek, xsk_ring_cons__release, xsk_ring_prod__reserve,
+        xsk_ring_prod__submit,
     };
 
     use super::*;
@@ -263,29 +266,53 @@ mod tests {
     const SIZE: u32 = 4;
 
     /// Memory standing in for the pages the kernel maps for a ring.
+    ///
+    /// Held as raw pointers rather than as boxes. The pointers handed
+    /// out below stay in use for as long as the ring holding this
+    /// does, and a box asserts exclusive access to what it points at
+    /// every time it is moved, which would invalidate every one of
+    /// them the moment this is moved into that ring.
     struct RingMem {
-        positions: Box<[u32; 2]>,
-        entries: Box<[u64]>,
+        positions: *mut [u32; 2],
+        entries: *mut [u64],
     }
 
     impl RingMem {
         fn new(size: u32) -> Self {
+            // An rx or tx ring's entries are `xdp_desc`, wider than
+            // the addresses a fill or comp ring holds, so the entry
+            // area is sized for the wider of the two.
+            let entry_u64s = size_of::<xdp_desc>().div_ceil(size_of::<u64>());
+
             Self {
-                positions: Box::new([0; 2]),
-                entries: vec![0; size as usize].into_boxed_slice(),
+                positions: Box::into_raw(Box::new([0; 2])),
+                entries: Box::into_raw(vec![0; size as usize * entry_u64s].into_boxed_slice()),
             }
         }
 
-        fn producer(&mut self) -> *mut u32 {
-            &mut self.positions[0]
+        fn producer(&self) -> *mut u32 {
+            self.positions.cast()
         }
 
-        fn consumer(&mut self) -> *mut u32 {
-            &mut self.positions[1]
+        fn consumer(&self) -> *mut u32 {
+            // The consumer position sits alongside the producer, so
+            // this stays within the allocation the pointer came from.
+            unsafe { self.positions.cast::<u32>().add(1) }
         }
 
-        fn entries(&mut self) -> *mut u64 {
-            self.entries.as_mut_ptr()
+        fn entries(&self) -> *mut u64 {
+            self.entries.cast()
+        }
+    }
+
+    impl Drop for RingMem {
+        fn drop(&mut self) {
+            // SAFETY: both pointers came from `Box::into_raw` in
+            // `new`, and nothing else frees them.
+            unsafe {
+                drop(Box::from_raw(self.positions));
+                drop(Box::from_raw(self.entries));
+            }
         }
     }
 
@@ -297,7 +324,7 @@ mod tests {
 
     impl FakeCons {
         fn new(size: u32) -> Self {
-            let mut mem = RingMem::new(size);
+            let mem = RingMem::new(size);
 
             // libxdp sets an rx ring's cached positions from the
             // ring's own and leaves a comp ring's zeroed, which on a
@@ -344,7 +371,7 @@ mod tests {
 
     impl FakeProd {
         fn new(size: u32) -> Self {
-            let mut mem = RingMem::new(size);
+            let mem = RingMem::new(size);
 
             // libxdp keeps a producer ring's cached consumer
             // position a ring size ahead of the real one, which is
@@ -378,46 +405,82 @@ mod tests {
         }
     }
 
+    /// Miri cannot run the tests below, which call into libxdp, so
+    /// this stands in for them where `RingMem` is concerned: it holds
+    /// the pointers a ring is built from the same way, and writes
+    /// through every one of them after the memory has been moved.
+    #[test]
+    fn ring_mem_pointers_all_stay_usable() {
+        struct Ring {
+            producer: *mut u32,
+            consumer: *mut u32,
+            entries: *mut u64,
+            _mem: RingMem,
+        }
+
+        let mem = RingMem::new(SIZE);
+
+        let ring = Ring {
+            producer: mem.producer(),
+            consumer: mem.consumer(),
+            entries: mem.entries(),
+            _mem: mem,
+        };
+
+        unsafe {
+            for i in 0..SIZE {
+                *ring.entries.add(i as usize) = i.into();
+            }
+
+            *ring.producer = SIZE;
+            *ring.consumer = 1;
+
+            assert_eq!(*ring.producer, SIZE);
+            assert_eq!(*ring.consumer, 1);
+            assert_eq!(*ring.entries.add(1), 1);
+        }
+    }
+
     // These call into libxdp, which Miri cannot execute.
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn cons_nb_avail_is_zero_on_an_empty_ring() {
+    fn cons_nb_avail_exact_is_zero_on_an_empty_ring() {
         let mut cons = FakeCons::new(SIZE);
 
-        assert_eq!(unsafe { cons_nb_avail(cons.as_ptr()) }, 0);
-        assert_eq!(unsafe { cons_nb_avail(cons.as_ptr()) }, 0);
+        assert_eq!(unsafe { cons_nb_avail_exact(cons.as_ptr()) }, 0);
+        assert_eq!(unsafe { cons_nb_avail_exact(cons.as_ptr()) }, 0);
     }
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn cons_nb_avail_sees_late_arrivals() {
+    fn cons_nb_avail_exact_sees_late_arrivals() {
         let mut cons = FakeCons::new(SIZE);
 
         cons.kernel_produce(1);
 
-        assert_eq!(unsafe { cons_nb_avail(cons.as_ptr()) }, 1);
+        assert_eq!(unsafe { cons_nb_avail_exact(cons.as_ptr()) }, 1);
 
         cons.kernel_produce(2);
 
-        assert_eq!(unsafe { cons_nb_avail(cons.as_ptr()) }, 3);
+        assert_eq!(unsafe { cons_nb_avail_exact(cons.as_ptr()) }, 3);
     }
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn cons_nb_avail_is_idempotent() {
+    fn cons_nb_avail_exact_is_idempotent() {
         let mut cons = FakeCons::new(SIZE);
 
         cons.kernel_produce(2);
 
         for _ in 0..3 {
-            assert_eq!(unsafe { cons_nb_avail(cons.as_ptr()) }, 2);
+            assert_eq!(unsafe { cons_nb_avail_exact(cons.as_ptr()) }, 2);
         }
     }
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn cons_nb_avail_restores_the_ring_positions() {
+    fn cons_nb_avail_exact_restores_the_ring_positions() {
         let mut cons = FakeCons::new(SIZE);
 
         cons.kernel_produce(2);
@@ -425,7 +488,7 @@ mod tests {
         let cached_cons = cons.cached_cons();
         let consumer = cons.consumer();
 
-        assert_eq!(unsafe { cons_nb_avail(cons.as_ptr()) }, 2);
+        assert_eq!(unsafe { cons_nb_avail_exact(cons.as_ptr()) }, 2);
 
         assert_eq!(cons.cached_cons(), cached_cons);
         assert_eq!(cons.consumer(), consumer);
@@ -433,7 +496,7 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn cons_nb_avail_after_a_partial_consume() {
+    fn cons_nb_avail_exact_after_a_partial_consume() {
         let mut cons = FakeCons::new(SIZE);
 
         cons.kernel_produce(3);
@@ -447,27 +510,27 @@ mod tests {
 
         unsafe { xsk_ring_cons__release(cons.as_ptr(), 1) };
 
-        assert_eq!(unsafe { cons_nb_avail(cons.as_ptr()) }, 2);
+        assert_eq!(unsafe { cons_nb_avail_exact(cons.as_ptr()) }, 2);
     }
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn cons_nb_avail_reports_a_full_ring() {
+    fn cons_nb_avail_exact_reports_a_full_ring() {
         let mut cons = FakeCons::new(SIZE);
 
         cons.kernel_produce(SIZE);
 
-        assert_eq!(unsafe { cons_nb_avail(cons.as_ptr()) }, SIZE);
+        assert_eq!(unsafe { cons_nb_avail_exact(cons.as_ptr()) }, SIZE);
     }
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn cons_nb_avail_leaves_every_entry_for_a_later_peek() {
+    fn cons_nb_avail_exact_leaves_every_entry_for_a_later_peek() {
         let mut cons = FakeCons::new(SIZE);
 
         cons.kernel_produce(3);
 
-        assert_eq!(unsafe { cons_nb_avail(cons.as_ptr()) }, 3);
+        assert_eq!(unsafe { cons_nb_avail_exact(cons.as_ptr()) }, 3);
 
         let mut idx = 0;
 
@@ -480,15 +543,15 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn prod_nb_free_is_the_ring_size_on_an_empty_ring() {
+    fn prod_nb_free_exact_is_the_ring_size_on_an_empty_ring() {
         let mut prod = FakeProd::new(SIZE);
 
-        assert_eq!(unsafe { prod_nb_free(prod.as_ptr()) }, SIZE);
+        assert_eq!(unsafe { prod_nb_free_exact(prod.as_ptr()) }, SIZE);
     }
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn prod_nb_free_is_zero_on_a_full_ring() {
+    fn prod_nb_free_exact_is_zero_on_a_full_ring() {
         let mut prod = FakeProd::new(SIZE);
 
         let mut idx = 0;
@@ -500,12 +563,12 @@ mod tests {
 
         unsafe { xsk_ring_prod__submit(prod.as_ptr(), SIZE) };
 
-        assert_eq!(unsafe { prod_nb_free(prod.as_ptr()) }, 0);
+        assert_eq!(unsafe { prod_nb_free_exact(prod.as_ptr()) }, 0);
     }
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn prod_nb_free_tracks_reservations() {
+    fn prod_nb_free_exact_tracks_reservations() {
         let mut prod = FakeProd::new(SIZE);
 
         let mut idx = 0;
@@ -515,12 +578,12 @@ mod tests {
             2
         );
 
-        assert_eq!(unsafe { prod_nb_free(prod.as_ptr()) }, 2);
+        assert_eq!(unsafe { prod_nb_free_exact(prod.as_ptr()) }, 2);
     }
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn prod_nb_free_sees_entries_taken_by_the_kernel() {
+    fn prod_nb_free_exact_sees_entries_taken_by_the_kernel() {
         let mut prod = FakeProd::new(SIZE);
 
         let mut idx = 0;
@@ -534,12 +597,12 @@ mod tests {
 
         prod.kernel_consume(2);
 
-        assert_eq!(unsafe { prod_nb_free(prod.as_ptr()) }, SIZE);
+        assert_eq!(unsafe { prod_nb_free_exact(prod.as_ptr()) }, SIZE);
     }
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn prod_nb_free_leaves_the_cached_producer_position_alone() {
+    fn prod_nb_free_exact_leaves_the_cached_producer_position_alone() {
         let mut prod = FakeProd::new(SIZE);
 
         let mut idx = 0;
@@ -553,7 +616,7 @@ mod tests {
 
         let cached_prod = prod.cached_prod();
 
-        assert_eq!(unsafe { prod_nb_free(prod.as_ptr()) }, 2);
+        assert_eq!(unsafe { prod_nb_free_exact(prod.as_ptr()) }, 2);
         assert_eq!(prod.cached_prod(), cached_prod);
 
         assert_eq!(

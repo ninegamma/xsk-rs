@@ -4,7 +4,7 @@ use setup::{ETHERNET_PACKET, PacketGenerator, WAIT_TIMEOUT, Xsk, XskConfig, wait
 
 use libxdp_sys::XDP_PACKET_HEADROOM;
 use serial_test::serial;
-use std::{convert::TryInto, io::Write};
+use std::{convert::TryInto, io::Write, thread, time::Duration};
 use xsk_rs::config::{FrameSize, QueueSize, SocketConfig, UmemConfig, XDP_UMEM_MIN_CHUNK_SIZE};
 
 const CQ_SIZE: u32 = 4;
@@ -390,37 +390,6 @@ async fn consume_one_headroom_len_reset_after_receive() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn nb_avail_reports_received_packets_and_honors_desired() {
-    fn test(dev1: (Xsk, PacketGenerator), dev2: (Xsk, PacketGenerator)) {
-        let mut xsk1 = dev1.0;
-        let mut xsk2 = dev2.0;
-
-        assert_eq!(xsk2.rx_q.nb_avail(RX_Q_SIZE), 0);
-
-        unsafe {
-            assert_eq!(xsk2.fq.produce(&xsk2.descs[..2]), 2);
-
-            for desc in &mut xsk1.descs[..2] {
-                xsk1.umem
-                    .data_mut(desc)
-                    .cursor()
-                    .write_all(&ETHERNET_PACKET[..])
-                    .unwrap();
-            }
-
-            assert_eq!(xsk1.tx_q.produce_and_wakeup(&xsk1.descs[..2]).unwrap(), 2);
-        }
-
-        assert!(xsk2.rx_q.poll(100).unwrap());
-        assert_eq!(xsk2.rx_q.nb_avail(1), 1);
-        assert_eq!(xsk2.rx_q.nb_avail(RX_Q_SIZE), 2);
-    }
-
-    build_configs_and_run_test(test).await
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
 async fn xdp_statistics_report_dropped_packet() {
     fn test(dev1: (Xsk, PacketGenerator), dev2: (Xsk, PacketGenerator)) {
         unsafe {
@@ -470,11 +439,11 @@ fn send(xsk: &mut Xsk, nb: usize) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn nb_avail_on_fresh_queue_is_zero() {
+async fn nb_avail_exact_on_fresh_queue_is_zero() {
     fn test(dev1: (Xsk, PacketGenerator), _dev2: (Xsk, PacketGenerator)) {
         let mut xsk1 = dev1.0;
 
-        assert_eq!(xsk1.rx_q.nb_avail(), 0);
+        assert_eq!(xsk1.rx_q.nb_avail_exact(), 0);
     }
 
     build_configs_and_run_test(test).await
@@ -482,7 +451,7 @@ async fn nb_avail_on_fresh_queue_is_zero() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn nb_avail_sees_late_arrivals() {
+async fn nb_avail_exact_sees_late_arrivals() {
     fn test(dev1: (Xsk, PacketGenerator), dev2: (Xsk, PacketGenerator)) {
         let mut xsk1 = dev1.0;
         let mut xsk2 = dev2.0;
@@ -493,14 +462,24 @@ async fn nb_avail_sees_late_arrivals() {
         // cached producer position would still report one here.
         send(&mut xsk1, 1);
 
-        wait_until(WAIT_TIMEOUT, || xsk2.rx_q.nb_avail() == 1);
+        wait_until(WAIT_TIMEOUT, || xsk2.rx_q.nb_avail_exact() == 1);
+
+        // The kernel drops a zero length frame, so the second packet
+        // has to be written before it is sent.
+        unsafe {
+            xsk1.umem
+                .data_mut(&mut xsk1.descs[1])
+                .cursor()
+                .write_all(&ETHERNET_PACKET[..])
+                .unwrap();
+        }
 
         assert_eq!(
             unsafe { xsk1.tx_q.produce_and_wakeup(&xsk1.descs[1..2]).unwrap() },
             1
         );
 
-        wait_until(WAIT_TIMEOUT, || xsk2.rx_q.nb_avail() == 2);
+        wait_until(WAIT_TIMEOUT, || xsk2.rx_q.nb_avail_exact() == 2);
     }
 
     build_configs_and_run_test(test).await
@@ -508,7 +487,7 @@ async fn nb_avail_sees_late_arrivals() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn nb_avail_is_idempotent() {
+async fn nb_avail_exact_is_idempotent() {
     fn test(dev1: (Xsk, PacketGenerator), dev2: (Xsk, PacketGenerator)) {
         let mut xsk1 = dev1.0;
         let mut xsk2 = dev2.0;
@@ -517,10 +496,10 @@ async fn nb_avail_is_idempotent() {
 
         send(&mut xsk1, 2);
 
-        wait_until(WAIT_TIMEOUT, || xsk2.rx_q.nb_avail() == 2);
+        wait_until(WAIT_TIMEOUT, || xsk2.rx_q.nb_avail_exact() == 2);
 
         for _ in 0..3 {
-            assert_eq!(xsk2.rx_q.nb_avail(), 2);
+            assert_eq!(xsk2.rx_q.nb_avail_exact(), 2);
         }
     }
 
@@ -529,7 +508,7 @@ async fn nb_avail_is_idempotent() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn nb_avail_does_not_consume() {
+async fn nb_avail_exact_does_not_consume() {
     fn test(dev1: (Xsk, PacketGenerator), dev2: (Xsk, PacketGenerator)) {
         let mut xsk1 = dev1.0;
         let mut xsk2 = dev2.0;
@@ -540,7 +519,7 @@ async fn nb_avail_does_not_consume() {
 
         send(&mut xsk1, 2);
 
-        wait_until(WAIT_TIMEOUT, || xsk2.rx_q.nb_avail() == 2);
+        wait_until(WAIT_TIMEOUT, || xsk2.rx_q.nb_avail_exact() == 2);
 
         assert_eq!(unsafe { xsk2.rx_q.consume(&mut xsk2.descs[..2]) }, 2);
 
@@ -566,7 +545,7 @@ async fn nb_avail_does_not_consume() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn nb_avail_after_partial_consume() {
+async fn nb_avail_exact_after_partial_consume() {
     fn test(dev1: (Xsk, PacketGenerator), dev2: (Xsk, PacketGenerator)) {
         let mut xsk1 = dev1.0;
         let mut xsk2 = dev2.0;
@@ -575,11 +554,11 @@ async fn nb_avail_after_partial_consume() {
 
         send(&mut xsk1, 3);
 
-        wait_until(WAIT_TIMEOUT, || xsk2.rx_q.nb_avail() == 3);
+        wait_until(WAIT_TIMEOUT, || xsk2.rx_q.nb_avail_exact() == 3);
 
         assert_eq!(unsafe { xsk2.rx_q.consume_one(&mut xsk2.descs[0]) }, 1);
 
-        assert_eq!(xsk2.rx_q.nb_avail(), 2);
+        assert_eq!(xsk2.rx_q.nb_avail_exact(), 2);
     }
 
     build_configs_and_run_test(test).await
@@ -587,7 +566,7 @@ async fn nb_avail_after_partial_consume() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn nb_avail_reports_full_ring() {
+async fn nb_avail_exact_reports_full_ring() {
     fn test(dev1: (Xsk, PacketGenerator), dev2: (Xsk, PacketGenerator)) {
         let mut xsk1 = dev1.0;
         let mut xsk2 = dev2.0;
@@ -601,7 +580,87 @@ async fn nb_avail_reports_full_ring() {
 
         send(&mut xsk1, rx_q_size);
 
-        wait_until(WAIT_TIMEOUT, || xsk2.rx_q.nb_avail() == RX_Q_SIZE);
+        wait_until(WAIT_TIMEOUT, || xsk2.rx_q.nb_avail_exact() == RX_Q_SIZE);
+    }
+
+    build_configs_and_run_test(test).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn nb_avail_on_fresh_queue_is_zero() {
+    fn test(dev1: (Xsk, PacketGenerator), _dev2: (Xsk, PacketGenerator)) {
+        let mut xsk1 = dev1.0;
+
+        assert_eq!(xsk1.rx_q.nb_avail(1), 0);
+    }
+
+    build_configs_and_run_test(test).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn nb_avail_is_capped_at_nb() {
+    fn test(dev1: (Xsk, PacketGenerator), dev2: (Xsk, PacketGenerator)) {
+        let mut xsk1 = dev1.0;
+        let mut xsk2 = dev2.0;
+
+        assert_eq!(unsafe { xsk2.fq.produce(&xsk2.descs[..3]) }, 3);
+
+        send(&mut xsk1, 3);
+
+        // Waiting on the cached count would spin forever, since
+        // libxdp stops refreshing the cache once it has anything to
+        // give.
+        wait_until(WAIT_TIMEOUT, || xsk2.rx_q.nb_avail_exact() == 3);
+
+        assert_eq!(xsk2.rx_q.nb_avail(2), 2);
+
+        assert_eq!(xsk2.rx_q.nb_avail(5), 3);
+    }
+
+    build_configs_and_run_test(test).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn nb_avail_can_answer_from_a_stale_cache() {
+    fn test(dev1: (Xsk, PacketGenerator), dev2: (Xsk, PacketGenerator)) {
+        let mut xsk1 = dev1.0;
+        let mut xsk2 = dev2.0;
+
+        assert_eq!(unsafe { xsk2.fq.produce(&xsk2.descs[..3]) }, 3);
+
+        // Leaves libxdp's cache holding one entry, which is what
+        // stops it reloading later on.
+        send(&mut xsk1, 1);
+
+        wait_until(WAIT_TIMEOUT, || xsk2.rx_q.nb_avail_exact() == 1);
+
+        for i in 1..3 {
+            unsafe {
+                xsk1.umem
+                    .data_mut(&mut xsk1.descs[i])
+                    .cursor()
+                    .write_all(&ETHERNET_PACKET[..])
+                    .unwrap();
+            }
+        }
+
+        assert_eq!(
+            unsafe { xsk1.tx_q.produce_and_wakeup(&xsk1.descs[1..3]).unwrap() },
+            2
+        );
+
+        // Nothing on this side refreshes the cache, so there is no
+        // condition to wait on: the count below reads one whether the
+        // packets have arrived or not, and the sleep only makes it
+        // likely that they have.
+        thread::sleep(Duration::from_secs(1));
+
+        assert_eq!(xsk2.rx_q.nb_avail(RX_Q_SIZE), 1);
+
+        wait_until(WAIT_TIMEOUT, || xsk2.rx_q.nb_avail_exact() == 3);
     }
 
     build_configs_and_run_test(test).await
