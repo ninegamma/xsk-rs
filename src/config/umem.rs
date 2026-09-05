@@ -110,19 +110,29 @@ impl ConfigBuilder {
             });
         }
 
-        Ok(self.config)
+        Ok(self.config.into())
     }
 
     /// Similar to build, but return ConfigOpts instead of Config
     pub fn build_opts(&mut self) -> Result<ConfigOpts, ConfigBuildError> {
         let frame_size = self.config.frame_size.get();
-        let total_headroom =
-            XDP_PACKET_HEADROOM + self.config.frame_headroom + self.config.tx_metadata_len;
+        if !util::is_pow_of_two(frame_size) {
+            return Err(ConfigBuildError {
+                kind: ConfigBuildErrorKind::FrameSizeNotPowerOfTwo { frame_size },
+            });
+        }
+
+        // Widened before adding because each component is a `u32`.
+        let total_headroom = (XDP_PACKET_HEADROOM as u64)
+            + (self.config.frame_headroom as u64)
+            + (self.config.tx_metadata_len as u64);
         self.config.size = frame_size as u64 * self.frame_count.get() as u64;
-        if total_headroom > frame_size {
+        if total_headroom >= frame_size as u64 {
             Err(ConfigBuildError {
-                frame_size,
-                total_headroom,
+                kind: ConfigBuildErrorKind::TotalHeadroomLeavesNoRoomForData {
+                    frame_size,
+                    total_headroom,
+                },
             })
         } else {
             Ok(self.config)
