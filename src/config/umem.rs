@@ -209,7 +209,7 @@ impl Config {
     /// Is defined as the frame size minus both the XDP headroom and
     /// user headroom.
     pub fn mtu(&self) -> u32 {
-        self.frame_size.get() - (self.xdp_headroom() + self.frame_headroom)
+        self.frame_size.get() - self.frame_headroom
     }
 }
 
@@ -257,11 +257,6 @@ impl ConfigOpts {
         self.comp_queue_size
     }
 
-    /// The frame headroom reserved for the XDP program.
-    pub fn xdp_headroom(&self) -> u32 {
-        XDP_PACKET_HEADROOM
-    }
-
     /// The frame headroom available to the user.
     pub fn frame_headroom(&self) -> u32 {
         self.frame_headroom
@@ -283,7 +278,7 @@ impl ConfigOpts {
     /// Is defined as the frame size minus both the XDP headroom and
     /// user headroom.
     pub fn mtu(&self) -> u32 {
-        self.frame_size.get() - (self.xdp_headroom() + self.frame_headroom + self.tx_metadata_len)
+        self.frame_size.get() - self.frame_headroom
     }
 }
 
@@ -445,7 +440,7 @@ mod tests {
 
         assert_eq!(
             config.mtu(),
-            XDP_UMEM_MIN_CHUNK_SIZE - (frame_headroom + XDP_PACKET_HEADROOM)
+            XDP_UMEM_MIN_CHUNK_SIZE - frame_headroom
         );
     }
 }

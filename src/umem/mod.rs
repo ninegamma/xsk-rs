@@ -3,8 +3,9 @@
 mod mem;
 use mem::UmemRegion;
 
+/// Frame descriptors used to identify packet data within a [`Umem`].
 pub mod frame;
-use frame::{Data, DataMut, FrameDesc, Headroom, HeadroomMut};
+use frame::FrameDesc;
 
 mod fill_queue;
 pub use fill_queue::FillQueue;
@@ -190,17 +191,17 @@ impl Umem {
             return Err(UmemCreateError { reason, err: None });
         }
 
-        let frame_count = frame_count.get() as usize;
+        let frame_count = frame_count.get();
 
-        let mut frame_descs: Vec<FrameDesc> = Vec::with_capacity(frame_count);
+        let mut frame_descs: Vec<FrameDesc> = Vec::with_capacity(frame_count as usize);
 
         for i in 0..frame_count {
-            let addr = (i * frame_layout.frame_size())
-                + frame_layout.xdp_headroom
-                + frame_layout.frame_headroom;
+            let addr = (i as u64 * frame_layout.frame_size() as u64)
+                + frame_layout.frame_headroom as u64;
 
             frame_descs.push(FrameDesc::new(addr));
         }
+
 
         let umem = Umem {
             inner: Arc::new(Mutex::new(inner)),
@@ -266,14 +267,13 @@ impl Umem {
         // and it retains the rings and mapped memory until UMEM deletion.
         let inner = unsafe { UmemInner::new(umem_ptr, (fq, cq), mem.clone()) };
 
-        let frame_count = frame_count.get() as usize;
+        let frame_count = frame_count.get();
 
-        let mut frame_descs: Vec<FrameDesc> = Vec::with_capacity(frame_count);
+        let mut frame_descs: Vec<FrameDesc> = Vec::with_capacity(frame_count as usize);
 
         for i in 0..frame_count {
-            let addr = (i * frame_layout.frame_size())
-                + frame_layout.xdp_headroom
-                + frame_layout.frame_headroom;
+            let addr = (i as u64 * frame_layout.frame_size() as u64)
+                + frame_layout.frame_headroom as u64;
 
             frame_descs.push(FrameDesc::new(addr));
         }
@@ -286,116 +286,6 @@ impl Umem {
         Ok((umem, frame_descs))
     }
 
-    /// The headroom and packet data segments of the `Umem` frame
-    /// pointed at by `desc`. Contents are read-only.
-    ///
-    /// # Safety
-    ///
-    /// `desc` must correspond to a frame belonging to this
-    /// `Umem`. Passing the descriptor of another `Umem` is very
-    /// likely to result in incorrect memory access, by either
-    /// straddling frames or accessing memory outside the underlying
-    /// `Umem` area.
-    ///
-    /// Furthermore, the memory region accessed must not be mutably
-    /// accessed anywhere else at the same time, either in userspace
-    /// or by the kernel. To ensure this, care should be taken not to
-    /// use the frame after submission to either the [`TxQueue`] or
-    /// [`FillQueue`] until received over the [`CompQueue`] or
-    /// [`RxQueue`] respectively.
-    ///
-    /// [`TxQueue`]: crate::TxQueue
-    /// [`RxQueue`]: crate::RxQueue
-    #[inline]
-    pub unsafe fn frame(&self, desc: &FrameDesc) -> (Headroom<'_>, Data<'_>) {
-        // SAFETY: We know from the unsafe contract of this function that:
-        // a. Accessing the headroom and data segment identified by
-        // `desc` is valid, since it describes a frame in this UMEM.
-        // b. This access is sound since there are no mutable
-        // references to the headroom and data segments.
-        unsafe { self.mem.frame(desc) }
-    }
-
-    /// The headroom segment of the `Umem` frame pointed at by
-    /// `desc`. Contents are read-only.
-    ///
-    /// # Safety
-    ///
-    /// See [`frame`](Self::frame).
-    #[inline]
-    pub unsafe fn headroom(&self, desc: &FrameDesc) -> Headroom<'_> {
-        // SAFETY: see `frame`.
-        unsafe { self.mem.headroom(desc) }
-    }
-
-    /// The data segment of the `Umem` frame pointed at by
-    /// `desc`. Contents are read-only.
-    ///
-    /// # Safety
-    ///
-    /// See [`frame`](Self::frame).
-    #[inline]
-    pub unsafe fn data(&self, desc: &FrameDesc) -> Data<'_> {
-        // SAFETY: see `frame`.
-        unsafe { self.mem.data(desc) }
-    }
-
-    /// The headroom and packet data segments of the `Umem` frame
-    /// pointed at by `desc`. Contents are writeable.
-    ///
-    /// # Safety
-    ///
-    /// `desc` must correspond to a frame belonging to this
-    /// `Umem`. Passing the descriptor of another `Umem` is very
-    /// likely to result in incorrect memory access, by either
-    /// straddling frames or accessing memory outside the underlying
-    /// `Umem` area.
-    ///
-    /// Furthermore, the memory region accessed must not be mutably or
-    /// immutably accessed anywhere else at the same time, either in
-    /// userspace or by the kernel. To ensure this, care should be
-    /// taken not to use the frame after submission to either the
-    /// [`TxQueue`] or [`FillQueue`] until received over the
-    /// [`CompQueue`] or [`RxQueue`] respectively.
-    ///
-    /// [`TxQueue`]: crate::TxQueue
-    /// [`RxQueue`]: crate::RxQueue
-    #[inline]
-    pub unsafe fn frame_mut<'a>(
-        &'a self,
-        desc: &'a mut FrameDesc,
-    ) -> (HeadroomMut<'a>, DataMut<'a>) {
-        // SAFETY: We know from the unsafe contract of this function that:
-        // a. Accessing the headroom and data segment identified by
-        // `desc` is valid, since it describes a frame in this UMEM.
-        // b. This access is sound since there are no other mutable or
-        // immutable references to the headroom and data segments.
-        unsafe { self.mem.frame_mut(desc) }
-    }
-
-    /// The headroom segment of the `Umem` frame pointed at by
-    /// `desc`. Contents are writeable.
-    ///
-    /// # Safety
-    ///
-    /// See [`frame_mut`](Self::frame_mut).
-    #[inline]
-    pub unsafe fn headroom_mut<'a>(&'a self, desc: &'a mut FrameDesc) -> HeadroomMut<'a> {
-        // SAFETY: see `frame_mut`.
-        unsafe { self.mem.headroom_mut(desc) }
-    }
-
-    /// The data segment of the `Umem` frame pointed at by
-    /// `desc`. Contents are writeable.
-    ///
-    /// # Safety
-    ///
-    /// See [`frame_mut`](Self::frame_mut).
-    #[inline]
-    pub unsafe fn data_mut<'a>(&'a self, desc: &'a mut FrameDesc) -> DataMut<'a> {
-        // SAFETY: see `frame_mut`.
-        unsafe { self.mem.data_mut(desc) }
-    }
 
     /// Intended to be called on socket creation, this passes the
     /// create function a pointer to the UMEM along with the fill
@@ -547,14 +437,13 @@ impl Error for UmemCreateError {
 /// Dimensions of a [`Umem`] frame.
 #[derive(Debug, Clone, Copy)]
 struct FrameLayout {
-    xdp_headroom: usize,
-    frame_headroom: usize,
-    mtu: usize,
+    frame_headroom: u32,
+    mtu: u32,
 }
 
 impl FrameLayout {
-    fn frame_size(&self) -> usize {
-        self.xdp_headroom + self.frame_headroom + self.mtu
+    fn frame_size(&self) -> u32 {
+        self.frame_headroom + self.mtu
     }
 
     /// The offset from the start of the [`Umem`] of the frame that
@@ -571,22 +460,20 @@ impl FrameLayout {
     ///
     /// [`UmemConfigBuilder::build`]: crate::config::UmemConfigBuilder::build
     #[inline]
-    fn frame_start(&self, addr: usize) -> usize {
+    fn frame_start(&self, addr: u64) -> u64 {
         debug_assert!(
             self.frame_size().is_power_of_two(),
             "the mask below only finds a frame when the frame size is a power of two"
         );
-
-        addr & !(self.frame_size() - 1)
+        addr & !(self.frame_size() as u64 - 1)
     }
 }
 
 impl From<UmemConfig> for FrameLayout {
     fn from(c: UmemConfig) -> Self {
         Self {
-            xdp_headroom: c.xdp_headroom() as usize,
-            frame_headroom: c.frame_headroom() as usize,
-            mtu: c.mtu() as usize,
+            frame_headroom: c.frame_headroom(),
+            mtu: c.mtu(),
         }
     }
 }
@@ -594,9 +481,8 @@ impl From<UmemConfig> for FrameLayout {
 impl From<UmemConfigOpts> for FrameLayout {
     fn from(c: UmemConfigOpts) -> Self {
         Self {
-            xdp_headroom: c.xdp_headroom() as usize,
-            frame_headroom: c.frame_headroom() as usize,
-            mtu: c.mtu() as usize,
+            frame_headroom: c.frame_headroom(),
+            mtu: c.mtu(),
         }
     }
 }
@@ -619,24 +505,23 @@ mod tests {
 
         let layout: FrameLayout = config.into();
 
-        assert_eq!(config.frame_size().get() as usize, layout.frame_size())
+        assert_eq!(config.frame_size().get(), layout.frame_size())
     }
 
     fn test_layout() -> FrameLayout {
         FrameLayout {
-            xdp_headroom: 256,
             frame_headroom: 64,
-            mtu: 1728,
+            mtu: 1984,
         }
     }
 
     #[test]
     fn frame_start_of_an_address_umem_new_assigns() {
         let layout = test_layout();
-        let frame_size = layout.frame_size();
+        let frame_size = layout.frame_size() as u64;
 
         for i in 0..4 {
-            let addr = (i * frame_size) + layout.xdp_headroom + layout.frame_headroom;
+            let addr = (i * frame_size) + layout.frame_headroom as u64;
 
             assert_eq!(layout.frame_start(addr), i * frame_size);
         }
@@ -645,15 +530,14 @@ mod tests {
     #[test]
     fn frame_start_is_unchanged_when_the_packet_has_been_moved_back() {
         let layout = test_layout();
-        let frame_size = layout.frame_size();
+        let frame_size = layout.frame_size() as u64;
 
-        // An XDP program can move the packet back as far as
-        // `data_hard_start`, which sits at the end of the frame
-        // headroom, so a shift is never more than the XDP headroom.
+        // A packet can move back through the frame headroom while
+        // remaining in the same frame.
         for i in 0..4 {
-            let addr = (i * frame_size) + layout.xdp_headroom + layout.frame_headroom;
+            let addr = (i * frame_size) + layout.frame_headroom as u64;
 
-            for shift in 0..=layout.xdp_headroom {
+            for shift in 0..=layout.frame_headroom as u64 {
                 assert_eq!(layout.frame_start(addr - shift), i * frame_size);
             }
         }
@@ -662,7 +546,7 @@ mod tests {
     #[test]
     fn frame_start_recovers_the_frame_from_any_address_within_it() {
         let layout = test_layout();
-        let frame_size = layout.frame_size();
+        let frame_size = layout.frame_size() as u64;
 
         for i in 0..4 {
             for offset in 0..frame_size {

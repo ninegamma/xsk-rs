@@ -71,9 +71,8 @@ impl CompQueue {
                 let addr =
                     unsafe { *libxdp_sys::xsk_ring_cons__comp_addr(self.ring.as_ptr(), idx) };
 
-                desc.addr = addr as usize;
-                desc.lengths.data = 0;
-                desc.lengths.headroom = 0;
+                desc.addr = addr;
+                desc.length = 0;
                 desc.options = 0;
 
                 idx = idx.wrapping_add(1);
@@ -101,9 +100,8 @@ impl CompQueue {
         if cnt > 0 {
             let addr = unsafe { *libxdp_sys::xsk_ring_cons__comp_addr(self.ring.as_ptr(), idx) };
 
-            desc.addr = addr as usize;
-            desc.lengths.data = 0;
-            desc.lengths.headroom = 0;
+            desc.addr = addr;
+            desc.length= 0;
             desc.options = 0;
 
             unsafe { libxdp_sys::xsk_ring_cons__release(self.ring.as_ptr(), cnt) };
