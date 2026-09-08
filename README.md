@@ -26,6 +26,10 @@ should provide those concerns at a higher layer.
   fork boundary.
 - Reworked `FrameDesc` to use the native AF_XDP field types: `u64` addresses,
   `u32` lengths, and `u32` options.
+- Frame headroom is shaped by several cooperating layers—the kernel, NIC
+  driver, eBPF program, and user-space application—and each layer's
+  requirements must be respected when using `xsk-core`; see
+  [headroom.md](headroom.md) for a detailed explanation.
 - Replaced the former two-part `SegmentLengths` representation with the single
   packet length used by `xdp_desc`.
 - Replaced `with_lengths(headroom, data)` with `with_length(data)` and exposed

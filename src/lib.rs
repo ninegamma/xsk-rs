@@ -1,4 +1,4 @@
-//! # xsk-rs
+//! # xsk-core
 //!
 //! A rust interface for AF_XDP sockets using libbpf.
 //!
