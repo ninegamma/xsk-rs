@@ -459,6 +459,7 @@ impl FrameLayout {
     /// anything else.
     ///
     /// [`UmemConfigBuilder::build`]: crate::config::UmemConfigBuilder::build
+    #[cfg(test)]
     #[inline]
     fn frame_start(&self, addr: u64) -> u64 {
         debug_assert!(

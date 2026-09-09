@@ -1,126 +1,86 @@
 //! # xsk-core
 //!
-//! A rust interface for AF_XDP sockets using libbpf.
+//! `xsk-core` is a hard fork of the original [`xsk-rs`](https://github.com/DouglasGray/xsk-rs) project.
 //!
-//! For more information please see the [networking
-//! docs](https://www.kernel.org/doc/html/latest/networking/af_xdp.html)
-//! or a more [detailed
-//! overview](http://vger.kernel.org/lpc_net2018_talks/lpc18_paper_af_xdp_perf-v2.pdf).
+//! The fork is intended for applications that need a small, predictable
+//! AF_XDP binding. The UMEM and socket APIs remain largely unchanged from
+//! `xsk-rs`, so existing code can continue to use [`Umem`], [`Socket`], fill
+//! queues, completion queues, receive queues, and transmit queues in the same
+//! general way.
 //!
-//! An overview of XDP [setup
-//! dependencies](https://github.com/xdp-project/xdp-tutorial/blob/main/setup_dependencies.org)
-//! may also come in handy.
+//! The main architectural change is the descriptor model. [`FrameDesc`] is
+//! intended to be only a thin Rust layer over libxdp's `libxdp_sys::xsk`
+//! descriptor API. It carries the same essential descriptor data that is
+//! exchanged with the kernel:
 //!
-//! Some simple examples may be found in the [GitHub
-//! repo](https://github.com/DouglasGray/xsk-rs/tree/master/examples),
-//! including an example of use in a multithreaded context and another
-//! creating a socket with a shared [`Umem`].
+//! - `addr: u64` — the UMEM offset of the packet data;
+//! - `length: u32` — the packet data length; and
+//! - `options: u32` — descriptor options such as multi-buffer continuation.
 //!
-//! ### Safety
+//! [`FrameDesc`] does not own packet memory and does not interpret packet
+//! contents. Applications that need packet views, protocol parsing, or
+//! headroom management should provide those concerns at a higher layer.
 //!
-//! There is a fair amount of unsafe involved when using this library, and
-//! so the potential for disaster, however if you keep in mind the
-//! following then there should hopefully be few avenues for catastrophe:
-//! - When a frame / address has been submitted to the [`FillQueue`]
-//!   or [`TxQueue`], do not use it again until you have consumed it
-//!   from either the [`CompQueue`] or [`RxQueue`].
-//! - Do not use one [`Umem`]'s frame descriptors to access frames of
-//!   another, different [`Umem`]. For example, via [`Umem::frame`].
+//! ## Major changes from `xsk-rs`
 //!
-//! ### Usage
+//! - Renamed the crate to `xsk-core` and reset its version to `0.1.0` to mark
+//!   the fork boundary.
+//! - Reworked [`FrameDesc`] to use the native AF_XDP field types: `u64`
+//!   addresses, `u32` lengths, and `u32` options.
+//! - Frame headroom is shaped by several cooperating layers—the kernel, NIC
+//!   driver, eBPF program, and user-space application—and each layer's
+//!   requirements must be respected when using `xsk-core`; see
+//!   [headroom.md](../headroom.md) for a detailed explanation.
+//! - Replaced the former two-part `SegmentLengths` representation with the
+//!   single packet length used by `xdp_desc`.
+//! - Replaced `with_lengths(headroom, data)` with `with_length(data)` and
+//!   exposed direct `addr()`, `length()`, and `options()` accessors.
+//! - Updated RX and completion queue handling to copy descriptor address,
+//!   length, and options directly from libxdp without narrowing conversions.
+//! - Simplified UMEM frame layout and address calculations around the native
+//!   descriptor offset model.
+//! - Removed the old high-level UMEM frame data and cursor accessors from the
+//!   core API. Packet memory access and packet construction belong to the
+//!   application or protocol layer using this crate.
+//! - Removed integration tests that depended on the removed high-level
+//!   frame-memory API.
 //!
-//! The below example sends a packet from one interface to another.
+//! ## Relationship to the original project
 //!
-//! ```no_run
-//! use std::{convert::TryInto, io::Write, str};
-//! use xsk_rs::{
-//!     config::{SocketConfig, UmemConfig},
-//!     socket::Socket,
-//!     umem::Umem,
-//! };
+//! The original project remains the reference for the inherited AF_XDP socket
+//! and UMEM design. This repository deliberately diverges in descriptor and
+//! memory access handling, so code that directly uses `SegmentLengths`,
+//! `Umem::data`, `Umem::data_mut`, `Umem::headroom`, or the frame cursor API
+//! must be adapted to the new layering.
 //!
-//! // Create a UMEM for dev1 with 32 frames, whose sizes are
-//! // specified via the `UmemConfig` instance.
-//! let (dev1_umem, mut dev1_descs) =
-//!     Umem::new(UmemConfig::default(), 32.try_into().unwrap(), false)
-//!         .expect("failed to create UMEM");
+//! For AF_XDP background and kernel-level details, see the [Linux AF_XDP
+//! documentation](https://www.kernel.org/doc/html/latest/networking/af_xdp.html).
 //!
-//! // Bind an AF_XDP socket to the interface named `xsk_dev1`, on
-//! // queue 0.
-//! // SAFETY: no socket is bound to this device and queue id pair.
-//! let (mut dev1_tx_q, _dev1_rx_q, _dev1_fq_and_cq) = unsafe {
-//!     Socket::new(
-//!         SocketConfig::default(),
-//!         &dev1_umem,
-//!         &"xsk_dev1".parse().unwrap(),
-//!         0,
-//!     )
-//! }
-//! .expect("failed to create dev1 socket");
+//! ## Safety requirements
 //!
-//! // Create a UMEM for dev2. Another option is to use the same UMEM
-//! // as dev1 - to do that we'd just pass `dev1_umem` to the
-//! // `Socket::new` call. In this case the UMEM would be shared, and
-//! // so `dev1_descs` could be used in either context, but each
-//! // socket would have its own completion queue and fill queue.
-//! let (dev2_umem, mut dev2_descs) =
-//!     Umem::new(UmemConfig::default(), 32.try_into().unwrap(), false)
-//!         .expect("failed to create UMEM");
+//! The ownership rules of AF_XDP still apply:
 //!
-//! // Bind an AF_XDP socket to the interface named `xsk_dev2`, on
-//! // queue 0.
-//! // SAFETY: see above.
-//! let (_dev2_tx_q, mut dev2_rx_q, dev2_fq_and_cq) = unsafe {
-//!     Socket::new(
-//!         SocketConfig::default(),
-//!         &dev2_umem,
-//!         &"xsk_dev2".parse().unwrap(),
-//!         0,
-//!     )
-//! }
-//! .expect("failed to create dev2 socket");
+//! - Do not access a frame after submitting its descriptor to the fill queue
+//!   or transmit ring until the descriptor is returned through the completion
+//!   queue or receive ring.
+//! - Do not use a descriptor from one UMEM to access another UMEM.
+//! - Treat descriptor addresses as offsets within the UMEM associated with the
+//!   descriptor.
 //!
-//! let (mut dev2_fq, _dev2_cq) = dev2_fq_and_cq.expect("missing dev2 fill queue and comp queue");
+//! ## Building
 //!
-//! // 1. Add frames to dev2's fill queue so we are ready to receive
-//! // some packets.
-//! unsafe {
-//!     dev2_fq.produce(&dev2_descs);
-//! }
-//!
-//! // 2. Write to dev1's UMEM.
-//! let pkt = "Hello, world!".as_bytes();
-//!
-//! unsafe {
-//!     dev1_umem
-//!         .data_mut(&mut dev1_descs[0])
-//!         .cursor()
-//!         .write_all(pkt)
-//!         .expect("failed writing packet to frame")
-//! }
-//!
-//! // 3. Submit the frame to the kernel for transmission.
-//! println!("sending: {:?}", str::from_utf8(&pkt).unwrap());
-//!
-//! unsafe {
-//!     dev1_tx_q.produce_and_wakeup(&dev1_descs[..1]).unwrap();
-//! }
-//!
-//! // 4. Read on dev2.
-//! let pkts_recvd = unsafe { dev2_rx_q.poll_and_consume(&mut dev2_descs, 100).unwrap() };
-//!
-//! // 5. Confirm that one of the packets we received matches what we expect.
-//! for recv_desc in dev2_descs.iter().take(pkts_recvd) {
-//!     let data = unsafe { dev2_umem.data(recv_desc) };
-//!
-//!     if data.contents() == &pkt[..] {
-//!         println!("received: {:?}", str::from_utf8(data.contents()).unwrap());
-//!         return;
-//!     }
-//! }
-//!
-//! panic!("no matching packets received")
+//! ```text
+//! cargo build
+//! cargo test --lib
 //! ```
+//!
+//! Building and using AF_XDP sockets requires Linux, libxdp, and the
+//! appropriate kernel and interface configuration. Operations that create veth
+//! pairs or bind AF_XDP sockets may require elevated privileges.
+//!
+//! ## License
+//!
+//! This fork retains the MIT license of the original project. See [LICENSE](../LICENSE).
 #![deny(missing_docs)]
 #![deny(missing_debug_implementations)]
 #![deny(unsafe_op_in_unsafe_fn)]
