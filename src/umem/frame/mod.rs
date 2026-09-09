@@ -11,14 +11,17 @@ const XDP_PKT_CONTD: u32 = 1 << 0;
 /// Used to pass frame information between the kernel and
 /// userspace. `addr` is an offset in bytes from the start of the
 /// [`Umem`](super::Umem) and corresponds to the starting address of
-/// the packet data segment of some frame. `lengths` describes the
+/// the packet data segment of some frame. `length` describes the
 /// length (in bytes) of any data stored in the frame's headroom or
 /// data segments.
 #[derive(Debug, Clone, Copy)]
+#[repr(C)]
 pub struct FrameDesc {
     pub(crate) addr: u64,
-    pub(crate) options: u32,
+    // Field order must strictly match the kernel xdp_desc struct
+    // Length must precede options to align with C memory layout
     pub(crate) length: u32,
+    pub(crate) options: u32,
 }
 
 impl FrameDesc {
@@ -81,9 +84,55 @@ impl FrameDesc {
 
     #[inline]
     pub(crate) fn write_xdp_desc(&self, desc: &mut libxdp_sys::xdp_desc) {
-        desc.addr = self.addr;
-        desc.options = self.options;
-        desc.len = self.length;
+        // SAFETY: FrameDesc is explicitly repr(C) with a field layout, size,
+        // and alignment that match libxdp_sys::xdp_desc exactly. Both references
+        // point to valid, properly aligned memory of size equal to one xdp_desc,
+        // and the mutable reference to desc guarantees exclusive write access
+        // without data races.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self as *const FrameDesc as *const libxdp_sys::xdp_desc,
+                desc as *mut libxdp_sys::xdp_desc,
+                1,
+            );
+        }
+    }
+
+    #[inline]
+    pub(crate) fn read_xdp_desc(desc: &libxdp_sys::xdp_desc) -> Self {
+        let mut frame_desc = Self::default();
+        // SAFETY: FrameDesc is explicitly repr(C) with a field layout, size,
+        // and alignment that match libxdp_sys::xdp_desc exactly. Both pointers
+        // point to valid, properly aligned memory of size equal to one xdp_desc,
+        // and the source reference guarantees valid read access without data races.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                desc as *const libxdp_sys::xdp_desc as *const FrameDesc,
+                &mut frame_desc as *mut FrameDesc,
+                1,
+            );
+        }
+        frame_desc
+    }
+
+    /// Copies a contiguous range of kernel descriptors into frame descriptors.
+    ///
+    /// # Safety
+    ///
+    /// `src` and `dst` must each point to `count` valid, non-overlapping
+    /// descriptors. The descriptor layouts must remain identical.
+    #[inline]
+    pub(crate) unsafe fn read_xdp_desc_slice(
+        src: *const libxdp_sys::xdp_desc,
+        dst: *mut Self,
+        count: usize,
+    ) {
+        // SAFETY: The caller guarantees that both ranges are valid and
+        // non-overlapping. FrameDesc and xdp_desc have identical repr(C)
+        // layouts, so copying the descriptors as bytes preserves all fields.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.cast::<Self>(), dst, count);
+        }
     }
 }
 

@@ -55,18 +55,10 @@ impl RxQueue {
         let cnt = unsafe { libxdp_sys::xsk_ring_cons__peek(self.ring.as_ptr(), nb, &mut idx) };
 
         if cnt > 0 {
-            for desc in descs.iter_mut().take(cnt as usize) {
-                let recv_pkt_desc =
-                    unsafe { libxdp_sys::xsk_ring_cons__rx_desc(self.ring.as_ptr(), idx) };
-
-                unsafe {
-                    desc.addr = (*recv_pkt_desc).addr;
-                    desc.length = (*recv_pkt_desc).len;
-                    desc.options = (*recv_pkt_desc).options;
-                }
-
-                idx = idx.wrapping_add(1);
-            }
+            // SAFETY: peek returned `cnt` descriptors beginning at `idx`, and
+            // the ring remains exclusively borrowed through `self` until the
+            // descriptors are copied and released below.
+            unsafe { copy_rx_descs(self.ring.as_ptr(), idx, &mut descs[..cnt as usize]) };
 
             unsafe { libxdp_sys::xsk_ring_cons__release(self.ring.as_ptr(), cnt) };
         }
@@ -91,11 +83,7 @@ impl RxQueue {
             let recv_pkt_desc =
                 unsafe { libxdp_sys::xsk_ring_cons__rx_desc(self.ring.as_ptr(), idx) };
 
-            unsafe {
-                desc.addr = (*recv_pkt_desc).addr;
-                desc.length = (*recv_pkt_desc).len;
-                desc.options = (*recv_pkt_desc).options;
-            }
+            *desc = FrameDesc::read_xdp_desc(unsafe { &*recv_pkt_desc });
 
             unsafe { libxdp_sys::xsk_ring_cons__release(self.ring.as_ptr(), cnt) };
         }
@@ -192,5 +180,92 @@ impl RxQueue {
     #[inline]
     pub fn fd_mut(&mut self) -> &mut Fd {
         &mut self.socket.fd
+    }
+}
+
+/// Copies a batch of RX descriptors while handling the ring wrap-around once.
+///
+/// The ring is power-of-two sized, so `mask` maps the absolute consumer index
+/// to the first entry. At most two contiguous ranges are needed for a batch.
+#[inline]
+unsafe fn copy_rx_descs(ring: *mut libxdp_sys::xsk_ring_cons, idx: u32, dst: &mut [FrameDesc]) {
+    let mask = unsafe { (*ring).mask };
+    let size = unsafe { (*ring).size };
+    let start = idx & mask;
+    let first_count = (size - start).min(dst.len() as u32) as usize;
+    let second_count = dst.len() - first_count;
+    let ring_descs = unsafe { (*ring).ring.cast::<libxdp_sys::xdp_desc>() };
+
+    // SAFETY: `peek` guarantees that the ring contains the requested
+    // descriptors. The first and second ranges are contiguous and together
+    // cover exactly `dst`; neither source range overlaps the destination.
+    unsafe {
+        FrameDesc::read_xdp_desc_slice(
+            ring_descs.add(start as usize),
+            dst.as_mut_ptr(),
+            first_count,
+        );
+
+        if second_count > 0 {
+            FrameDesc::read_xdp_desc_slice(
+                ring_descs,
+                dst.as_mut_ptr().add(first_count),
+                second_count,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::copy_rx_descs;
+
+    #[test]
+    fn copy_rx_descs_copies_across_ring_wrap() {
+        let mut ring_descs = [
+            libxdp_sys::xdp_desc {
+                addr: 10,
+                len: 11,
+                options: 12,
+            },
+            libxdp_sys::xdp_desc {
+                addr: 20,
+                len: 21,
+                options: 22,
+            },
+            libxdp_sys::xdp_desc {
+                addr: 30,
+                len: 31,
+                options: 32,
+            },
+            libxdp_sys::xdp_desc {
+                addr: 40,
+                len: 41,
+                options: 42,
+            },
+        ];
+        let ring = libxdp_sys::xsk_ring_cons {
+            cached_prod: 0,
+            cached_cons: 0,
+            mask: 3,
+            size: 4,
+            producer: std::ptr::null_mut(),
+            consumer: std::ptr::null_mut(),
+            ring: ring_descs.as_mut_ptr().cast(),
+            flags: std::ptr::null_mut(),
+        };
+        let mut copied = [crate::umem::frame::FrameDesc::default(); 3];
+
+        unsafe { copy_rx_descs(&ring as *const _ as *mut _, 3, &mut copied) };
+
+        assert_eq!(copied[0].addr(), 40);
+        assert_eq!(copied[0].length(), 41);
+        assert_eq!(copied[0].options(), 42);
+        assert_eq!(copied[1].addr(), 10);
+        assert_eq!(copied[1].length(), 11);
+        assert_eq!(copied[1].options(), 12);
+        assert_eq!(copied[2].addr(), 20);
+        assert_eq!(copied[2].length(), 21);
+        assert_eq!(copied[2].options(), 22);
     }
 }
