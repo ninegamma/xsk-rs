@@ -34,15 +34,21 @@ should provide those concerns at a higher layer.
   packet length used by `xdp_desc`.
 - Replaced `with_lengths(headroom, data)` with `with_length(data)` and exposed
   direct `addr()`, `length()`, and `options()` accessors.
-- Updated RX and completion queue handling to copy descriptor address, length,
-  and options directly from libxdp without narrowing conversions.
+- Updated RX queue handling to copy descriptor address, length, and options
+  directly from libxdp without narrowing conversions, and changed completion
+  queue consumption to return frame addresses directly through `&mut [u64]`
+  and `&mut u64` APIs.
+- Changed `FillQueue` production to accept `&[u64]` frame addresses, with
+  matching single-address and wakeup variants.
+- Optimized fill and completion queue batches by splitting wrapped rings into
+  at most two contiguous ranges and copying each range in bulk.
 - Simplified UMEM frame layout and address calculations around the native
   descriptor offset model.
 - Removed the old high-level UMEM frame data and cursor accessors from the
   core API. Packet memory access and packet construction belong to the
   application or protocol layer using this crate.
-- Removed the original examples and integration tests that depended on the
-  removed high-level frame-memory API.
+- Removed integration tests that depended on the removed high-level
+  frame-memory API.
 
 ## Relationship to the original project
 

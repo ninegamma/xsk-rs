@@ -28,7 +28,7 @@ use std::{
 
 use serial_test::serial;
 use setup::{VethDevConfig, veth_setup};
-use xsk_rs::{
+use xsk_core::{
     CompQueue, FillQueue, FrameDesc, RxQueue, Socket, TxQueue, Umem,
     config::{Interface, LibxdpFlags, SocketConfig, UmemConfig},
     socket::SocketCreateError,
@@ -152,11 +152,12 @@ async fn fill_and_comp_queues_outliving_their_socket_are_still_usable() {
 
         // SAFETY: the descriptors belong to `umem`, and none of them
         // are in the kernel's hands, this being a fresh socket.
-        let produced = unsafe { fq.produce(&descs) };
+        let addrs: Vec<u64> = descs.iter().map(FrameDesc::addr).collect();
+        let produced = unsafe { fq.produce(&addrs) };
 
         assert_eq!(produced, descs.len());
 
-        let mut completed = descs.clone();
+        let mut completed = vec![0_u64; descs.len()];
 
         // SAFETY: see above. Nothing has been transmitted, so this
         // only reads the ring, but read or write it faults just the

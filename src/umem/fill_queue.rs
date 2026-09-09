@@ -5,8 +5,6 @@ use crate::{
     socket::{Fd, Socket},
 };
 
-use super::frame::FrameDesc;
-
 /// Used to transfer ownership of [`Umem`](super::Umem) frames from
 /// user-space to kernel-space.
 ///
@@ -36,11 +34,11 @@ impl FillQueue {
         }
     }
 
-    /// Let the kernel know that the [`Umem`] frames described by
-    /// `descs` may be used to receive data. Returns the number of
+    /// Let the kernel know that the [`Umem`] frame addresses in
+    /// `addrs` may be used to receive data. Returns the number of
     /// frames submitted to the kernel.
     ///
-    /// Note that if the length of `descs` is greater than the number
+    /// Note that if the length of `addrs` is greater than the number
     /// of available spaces on the underlying ring buffer then no
     /// frames at all will be handed over to the kernel.
     ///
@@ -51,18 +49,18 @@ impl FillQueue {
     ///
     /// This function is unsafe as it is possible to cause a data race
     /// if used improperly. For example, by simultaneously submitting
-    /// the same frame descriptor to this `FillQueue` and the
+    /// the same frame address to this `FillQueue` and the
     /// [`TxQueue`].
     ///
-    /// Furthermore, the frames passed to this queue must belong to
+    /// Furthermore, the addresses passed to this queue must belong to
     /// the same [`Umem`] that this `FillQueue` instance is tied to.
     ///
     /// [`TxQueue`]: crate::TxQueue
     /// [`RxQueue`]: crate::RxQueue
     /// [`Umem`]: super::Umem
     #[inline]
-    pub unsafe fn produce(&mut self, descs: &[FrameDesc]) -> usize {
-        let nb = descs.len() as u32;
+    pub unsafe fn produce(&mut self, addrs: &[u64]) -> usize {
+        let nb = addrs.len() as u32;
 
         if nb == 0 {
             return 0;
@@ -73,14 +71,10 @@ impl FillQueue {
         let cnt = unsafe { libxdp_sys::xsk_ring_prod__reserve(self.ring.as_ptr(), nb, &mut idx) };
 
         if cnt > 0 {
-            for desc in descs.iter().take(cnt as usize) {
-                unsafe {
-                    *libxdp_sys::xsk_ring_prod__fill_addr(self.ring.as_ptr(), idx) =
-                        desc.addr as u64
-                };
-
-                idx = idx.wrapping_add(1);
-            }
+            // SAFETY: reserve returned `cnt` slots beginning at `idx`, and
+            // the ring remains exclusively borrowed through `self` until
+            // the addresses are copied and submitted below.
+            unsafe { copy_fill_addrs(self.ring.as_ptr(), idx, &addrs[..cnt as usize]) };
 
             unsafe { libxdp_sys::xsk_ring_prod__submit(self.ring.as_ptr(), cnt) };
         }
@@ -88,7 +82,7 @@ impl FillQueue {
         cnt as usize
     }
 
-    /// Same as [`produce`] but for a single frame descriptor.
+    /// Same as [`produce`] but for a single frame address.
     ///
     /// # Safety
     ///
@@ -96,14 +90,14 @@ impl FillQueue {
     ///
     /// [`produce`]: Self::produce
     #[inline]
-    pub unsafe fn produce_one(&mut self, desc: &FrameDesc) -> usize {
+    pub unsafe fn produce_one(&mut self, addr: &u64) -> usize {
         let mut idx = 0;
 
         let cnt = unsafe { libxdp_sys::xsk_ring_prod__reserve(self.ring.as_ptr(), 1, &mut idx) };
 
         if cnt > 0 {
             unsafe {
-                *libxdp_sys::xsk_ring_prod__fill_addr(self.ring.as_ptr(), idx) = desc.addr as u64
+                *libxdp_sys::xsk_ring_prod__fill_addr(self.ring.as_ptr(), idx) = *addr
             };
 
             unsafe { libxdp_sys::xsk_ring_prod__submit(self.ring.as_ptr(), cnt) };
@@ -127,11 +121,11 @@ impl FillQueue {
     #[inline]
     pub unsafe fn produce_and_wakeup(
         &mut self,
-        descs: &[FrameDesc],
+        addrs: &[u64],
         socket_fd: &mut Fd,
         poll_timeout: i32,
     ) -> io::Result<usize> {
-        let cnt = unsafe { self.produce(descs) };
+        let cnt = unsafe { self.produce(addrs) };
 
         if cnt > 0 && self.needs_wakeup() {
             self.wakeup(socket_fd, poll_timeout)?;
@@ -152,11 +146,11 @@ impl FillQueue {
     #[inline]
     pub unsafe fn produce_one_and_wakeup(
         &mut self,
-        desc: &FrameDesc,
+        addr: &u64,
         socket_fd: &mut Fd,
         poll_timeout: i32,
     ) -> io::Result<usize> {
-        let cnt = unsafe { self.produce_one(desc) };
+        let cnt = unsafe { self.produce_one(addr) };
 
         if cnt > 0 && self.needs_wakeup() {
             self.wakeup(socket_fd, poll_timeout)?;
@@ -222,5 +216,56 @@ impl FillQueue {
     #[inline]
     pub fn needs_wakeup(&self) -> bool {
         unsafe { libxdp_sys::xsk_ring_prod__needs_wakeup(self.ring.as_ptr()) != 0 }
+    }
+}
+
+/// Copies a batch of frame addresses into the fill ring while handling
+/// wrap-around once. At most two contiguous destination ranges are needed.
+#[inline]
+unsafe fn copy_fill_addrs(ring: *mut libxdp_sys::xsk_ring_prod, idx: u32, src: &[u64]) {
+    let mask = unsafe { (*ring).mask };
+    let size = unsafe { (*ring).size };
+    let start = (idx & mask) as usize;
+    let first_count = (size as usize - start).min(src.len());
+    let second_count = src.len() - first_count;
+    let ring_addrs = unsafe { (*ring).ring.cast::<u64>() };
+
+    // SAFETY: reserve guarantees that both destination ranges are writable
+    // ring entries, and together they cover exactly `src`.
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.as_ptr(), ring_addrs.add(start), first_count);
+
+        if second_count > 0 {
+            std::ptr::copy_nonoverlapping(
+                src.as_ptr().add(first_count),
+                ring_addrs,
+                second_count,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::copy_fill_addrs;
+
+    #[test]
+    fn copy_fill_addrs_copies_across_ring_wrap() {
+        let mut ring_addrs = [0_u64; 4];
+        let ring = libxdp_sys::xsk_ring_prod {
+            cached_prod: 0,
+            cached_cons: 0,
+            mask: 3,
+            size: 4,
+            producer: std::ptr::null_mut(),
+            consumer: std::ptr::null_mut(),
+            ring: ring_addrs.as_mut_ptr().cast(),
+            flags: std::ptr::null_mut(),
+        };
+        let src = [40, 50, 60];
+
+        unsafe { copy_fill_addrs(&ring as *const _ as *mut _, 3, &src) };
+
+        assert_eq!(ring_addrs, [50, 60, 0, 40]);
     }
 }

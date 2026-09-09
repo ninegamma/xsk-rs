@@ -10,7 +10,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use xsk_rs::{
+use xsk_core::{
     config::{Interface, SocketConfig, UmemConfig},
     socket::{RxQueue, Socket, TxQueue},
     umem::{CompQueue, FillQueue, Umem, frame::FrameDesc},

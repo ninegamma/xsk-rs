@@ -3,8 +3,6 @@ use crate::{
     socket::Socket,
 };
 
-use super::frame::FrameDesc;
-
 /// Used to transfer ownership of [`Umem`](super::Umem) frames from
 /// kernel-space to user-space.
 ///
@@ -34,29 +32,30 @@ impl CompQueue {
         }
     }
 
-    /// Update `descs` with details of frames whose contents have been
+    /// Update `addrs` with addresses of frames whose contents have been
     /// sent (after submission via the [`TxQueue`]) and may now be
-    /// used again. Returns the number of elements of `descs` which
-    /// have been updated.
+    /// used again. Returns the number of elements of `addrs` which
+    /// have been updated. The addresses are offsets within this queue's
+    /// [`Umem`].
     ///
     /// The number of entries updated will be less than or equal to
-    /// the length of `descs`. Entries will be updated sequentially
-    /// from the start of `descs` until the end.
+    /// the length of `addrs`. Entries will be updated sequentially
+    /// from the start of `addrs` until the end.
     ///
     /// Free frames should eventually be added back on to either the
     /// [`FillQueue`] or the [`TxQueue`].
     ///
     /// # Safety
     ///
-    /// The frames passed to this queue must belong to the same
-    /// [`Umem`] that this `CompQueue` instance is tied to.
+    /// `addrs` must point to writable memory, and the addresses returned by
+    /// this queue must only be reused with the associated [`Umem`].
     ///
     /// [`TxQueue`]: crate::socket::TxQueue
     /// [`FillQueue`]: crate::FillQueue
     /// [`Umem`]: super::Umem
     #[inline]
-    pub unsafe fn consume(&mut self, descs: &mut [FrameDesc]) -> usize {
-        let nb = descs.len() as u32;
+    pub unsafe fn consume(&mut self, addrs: &mut [u64]) -> usize {
+        let nb = addrs.len() as u32;
 
         if nb == 0 {
             return 0;
@@ -67,16 +66,10 @@ impl CompQueue {
         let cnt = unsafe { libxdp_sys::xsk_ring_cons__peek(self.ring.as_ptr(), nb, &mut idx) };
 
         if cnt > 0 {
-            for desc in descs.iter_mut().take(cnt as usize) {
-                let addr =
-                    unsafe { *libxdp_sys::xsk_ring_cons__comp_addr(self.ring.as_ptr(), idx) };
-
-                desc.addr = addr;
-                desc.length = 0;
-                desc.options = 0;
-
-                idx = idx.wrapping_add(1);
-            }
+            // SAFETY: peek returned `cnt` addresses beginning at `idx`, and
+            // the ring remains exclusively borrowed through `self` until the
+            // addresses are copied and released below.
+            unsafe { copy_comp_addrs(self.ring.as_ptr(), idx, &mut addrs[..cnt as usize]) };
 
             unsafe { libxdp_sys::xsk_ring_cons__release(self.ring.as_ptr(), cnt) };
         }
@@ -84,25 +77,22 @@ impl CompQueue {
         cnt as usize
     }
 
-    /// Same as [`consume`] but for a single frame descriptor.
+    /// Same as [`consume`] but for a single frame address.
     ///
     /// # Safety
     ///
-    /// See [`consume`].
+    /// `addr` must point to writable memory, and the returned address must
+    /// only be reused with the associated [`Umem`].
     ///
     /// [`consume`]: Self::consume
     #[inline]
-    pub unsafe fn consume_one(&mut self, desc: &mut FrameDesc) -> usize {
+    pub unsafe fn consume_one(&mut self, addr: &mut u64) -> usize {
         let mut idx = 0;
 
         let cnt = unsafe { libxdp_sys::xsk_ring_cons__peek(self.ring.as_ptr(), 1, &mut idx) };
 
         if cnt > 0 {
-            let addr = unsafe { *libxdp_sys::xsk_ring_cons__comp_addr(self.ring.as_ptr(), idx) };
-
-            desc.addr = addr;
-            desc.length= 0;
-            desc.options = 0;
+            *addr = unsafe { *libxdp_sys::xsk_ring_cons__comp_addr(self.ring.as_ptr(), idx) };
 
             unsafe { libxdp_sys::xsk_ring_cons__release(self.ring.as_ptr(), cnt) };
         }
@@ -141,5 +131,63 @@ impl CompQueue {
         // SAFETY: the ring is initialised and `&mut self` excludes
         // any other access to it.
         unsafe { ring::cons_nb_avail_exact(self.ring.as_ptr()) }
+    }
+}
+
+/// Copies a batch of completion addresses while handling ring wrap-around
+/// once. Completion entries contain only an address, so the descriptor fields
+/// are initialized while copying into the strided `FrameDesc` destinations.
+#[inline]
+unsafe fn copy_comp_addrs(
+    ring: *mut libxdp_sys::xsk_ring_cons,
+    idx: u32,
+    dst: &mut [u64],
+) {
+    let mask = unsafe { (*ring).mask };
+    let size = unsafe { (*ring).size };
+    let start = (idx & mask) as usize;
+    let first_count = (size as usize - start).min(dst.len());
+    let second_count = dst.len() - first_count;
+    let ring_addrs = unsafe { (*ring).ring.cast::<u64>() };
+
+    // SAFETY: `peek` guarantees that the ring contains the requested
+    // addresses. The two source ranges are contiguous and together cover
+    // exactly `dst`.
+    unsafe {
+        copy_comp_addr_range(ring_addrs.add(start), &mut dst[..first_count]);
+
+        if second_count > 0 {
+            copy_comp_addr_range(ring_addrs, &mut dst[first_count..]);
+        }
+    }
+}
+
+#[inline]
+unsafe fn copy_comp_addr_range(src: *const u64, dst: &mut [u64]) {
+    unsafe { std::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), dst.len()) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::copy_comp_addrs;
+
+    #[test]
+    fn copy_comp_addrs_copies_across_ring_wrap() {
+        let mut ring_addrs: [u64; 4] = [10, 20, 30, 40];
+        let ring = libxdp_sys::xsk_ring_cons {
+            cached_prod: 0,
+            cached_cons: 0,
+            mask: 3,
+            size: 4,
+            producer: std::ptr::null_mut(),
+            consumer: std::ptr::null_mut(),
+            ring: ring_addrs.as_mut_ptr().cast(),
+            flags: std::ptr::null_mut(),
+        };
+        let mut copied = [0; 3];
+
+        unsafe { copy_comp_addrs(&ring as *const _ as *mut _, 3, &mut copied) };
+
+        assert_eq!(copied, [40, 10, 20]);
     }
 }

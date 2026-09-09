@@ -35,8 +35,9 @@
 //!   single packet length used by `xdp_desc`.
 //! - Replaced `with_lengths(headroom, data)` with `with_length(data)` and
 //!   exposed direct `addr()`, `length()`, and `options()` accessors.
-//! - Updated RX and completion queue handling to copy descriptor address,
-//!   length, and options directly from libxdp without narrowing conversions.
+//! - Updated RX queue handling to copy descriptor address, length, and options
+//!   directly from libxdp without narrowing conversions, and changed completion
+//!   queue consumption to return frame addresses directly.
 //! - Simplified UMEM frame layout and address calculations around the native
 //!   descriptor offset model.
 //! - Removed the old high-level UMEM frame data and cursor accessors from the
